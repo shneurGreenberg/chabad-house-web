@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>בית החיים · Кадиш Новосибирск</title>
+  <style>
+    :root {
+      --bg: #2a2118;
+      --card: #3d3424;
+      --gold: #cfaf1f;
+      --text: #fff8e7;
+      --muted: #d9c9a8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      padding: 28px 20px 12px;
+      text-align: center;
+    }
+    h1 { margin: 0; font-size: 1.6rem; color: var(--gold); }
+    p.lead { margin: 8px 0 0; color: var(--muted); }
+    #status { text-align: center; color: var(--muted); padding: 12px; }
+    #memorial-people {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 16px;
+      padding: 16px 20px 40px;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+    article {
+      background: var(--card);
+      border-radius: 14px;
+      padding: 14px;
+      display: flex;
+      gap: 14px;
+      align-items: flex-start;
+    }
+    img {
+      width: 72px;
+      height: 96px;
+      object-fit: cover;
+      border-radius: 10px;
+      background: #334155;
+    }
+    .placeholder {
+      width: 72px;
+      height: 96px;
+      border-radius: 10px;
+      background: linear-gradient(#64748b, #334155);
+      flex: 0 0 72px;
+    }
+    h2 {
+      margin: 0 0 6px;
+      font-size: 1.05rem;
+    }
+    p { margin: 0; color: var(--muted); font-size: 0.92rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>בית החיים</h1>
+    <p class="lead">Имена из реестра кадиша Бейт Менахем, Новосибирск</p>
+  </header>
+  <div id="status">Загрузка…</div>
+  <div id="memorial-people"></div>
+  <script>
+    const HOST = 'https://synagogue-kadish-shneur.amvera.io';
+    const PEOPLE_API = HOST + '/s/novosibirsk/api/people';
+    const BOARD_API = HOST + '/s/novosibirsk/api/board';
+
+    function escapeHtml(value) {
+      return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function absoluteUrl(value) {
+      const url = String(value || '').trim();
+      if (!url) return '';
+      if (/^https?:\/\//i.test(url)) return url;
+      if (url.startsWith('//')) return 'https:' + url;
+      if (url.startsWith('/')) return HOST + url;
+      return HOST + '/photos/' + url;
+    }
+
+    function photoUrl(person) {
+      if (person.photoThumbUrl) return absoluteUrl(person.photoThumbUrl);
+      if (person.photoUrl) return absoluteUrl(person.photoUrl);
+      const filename = String(person.photo || '').trim();
+      if (!filename) return '';
+      const query = ['w=280'];
+      const crop = person.photoCrop || {};
+      if (typeof crop.x === 'number' && crop.x !== 50) query.push('cx=' + crop.x);
+      if (typeof crop.y === 'number' && crop.y !== 50) query.push('cy=' + crop.y);
+      if (typeof crop.zoom === 'number' && crop.zoom !== 1) query.push('cz=' + crop.zoom);
+      return HOST + '/photos/' + encodeURIComponent(filename) + '?' + query.join('&');
+    }
+
+    function hebrewLabel(person) {
+      const hebrew = person.hebrewDateOfDeath;
+      if (typeof hebrew === 'string') return hebrew;
+      if (hebrew && hebrew.label) return hebrew.label;
+      return '';
+    }
+
+    function gregorianLabel(person) {
+      const death = person.gregorianDateOfDeath || {};
+      if (death.date && death.month && death.year) {
+        const d = String(death.date).padStart(2, '0');
+        const m = String(death.month).padStart(2, '0');
+        return d + '.' + m + '.' + death.year;
+      }
+      return '';
+    }
+
+    function peopleFromPayload(payload) {
+      if (Array.isArray(payload)) return payload;
+      if (payload && Array.isArray(payload.people)) return payload.people;
+      return [];
+    }
+
+    async function loadPeople() {
+      const urls = [PEOPLE_API, BOARD_API];
+      for (const url of urls) {
+        try {
+          const res = await fetch(url);
+          if (!res.ok) continue;
+          const people = peopleFromPayload(await res.json());
+          if (people.length) return people;
+        } catch (err) {}
+      }
+      throw new Error('registry unavailable');
+    }
+
+    loadPeople()
+      .then((people) => {
+        document.getElementById('status').textContent =
+          people.length + ' имён';
+        document.getElementById('memorial-people').innerHTML = people.map((person) => {
+          const src = photoUrl(person);
+          const hebrew = hebrewLabel(person);
+          const gregorian = gregorianLabel(person);
+          return `
+            <article>
+              ${src
+                ? `<img src="${escapeHtml(src)}" alt="${escapeHtml(person.name)}">`
+                : '<div class="placeholder" aria-hidden="true"></div>'}
+              <div>
+                <h2>${escapeHtml(person.name)}</h2>
+                ${hebrew ? `<p>${escapeHtml(hebrew)}</p>` : ''}
+                ${gregorian ? `<p>${escapeHtml(gregorian)}</p>` : ''}
+              </div>
+            </article>
+          `;
+        }).join('');
+      })
+      .catch(() => {
+        document.getElementById('status').textContent =
+          'Не удалось загрузить реестр кадиша.';
+      });
+  </script>
+</body>
+</html>

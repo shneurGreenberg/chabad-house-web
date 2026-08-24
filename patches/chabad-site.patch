@@ -1,0 +1,414 @@
+From 55036377aacf4a2db72cc1ed3f9de398fe6b5868 Mon Sep 17 00:00:00 2001
+From: shneurGreenberg <shneurGreenberg@users.noreply.github.com>
+Date: Mon, 24 Aug 2026 16:06:21 +0000
+Subject: [PATCH] Load cemetery names and photos from the live kaddish people
+ API.
+
+The cemetery page now reads the public Novosibirsk registry at runtime, with the bundled JSON kept as an offline fallback.
+---
+ lib/data/kaddish.dart               | 147 ++++++++++++++++++++++++++++
+ lib/data/repository.dart            | 123 +++++++++++------------
+ lib/data/snapshot.dart              |   2 +
+ lib/models.dart                     |   2 +
+ lib/pages/client/cemetery_page.dart |  17 ++++
+ 5 files changed, 230 insertions(+), 61 deletions(-)
+ create mode 100644 lib/data/kaddish.dart
+
+diff --git a/lib/data/kaddish.dart b/lib/data/kaddish.dart
+new file mode 100644
+index 0000000..42f0026
+--- /dev/null
++++ b/lib/data/kaddish.dart
+@@ -0,0 +1,147 @@
++import '../models.dart';
++
++/// Live Novosibirsk kaddish registry used by the cemetery page.
++const kaddishHost = 'https://synagogue-kadish-shneur.amvera.io';
++const kaddishPeopleApi = '$kaddishHost/s/novosibirsk/api/people';
++const kaddishBoardApi = '$kaddishHost/s/novosibirsk/api/board';
++const kaddishPhotoBase = '$kaddishHost/photos/';
++
++/// Files that exist on the photo host even when the board record has no photo.
++const kaddishExtraPhotos = {193: '193.jpg'};
++
++List<Map<String, dynamic>> peopleFromKaddishJson(dynamic raw) {
++  if (raw is List) {
++    return [
++      for (final item in raw)
++        if (item is Map) Map<String, dynamic>.from(item),
++    ];
++  }
++  if (raw is Map) {
++    final people = raw['people'];
++    if (people is List) {
++      return [
++        for (final item in people)
++          if (item is Map) Map<String, dynamic>.from(item),
++      ];
++    }
++  }
++  return const [];
++}
++
++String absoluteKaddishUrl(String value) {
++  final v = value.trim();
++  if (v.isEmpty) return '';
++  if (v.startsWith('http://') || v.startsWith('https://')) return v;
++  if (v.startsWith('//')) return 'https:$v';
++  if (v.startsWith('/')) return '$kaddishHost$v';
++  return '$kaddishPhotoBase$v';
++}
++
++String photoUrlFromKaddish(String filename, dynamic crop) {
++  final name = filename.trim();
++  if (name.isEmpty) return '';
++  final query = <String>['w=280'];
++  if (crop is Map) {
++    final x = crop['x'];
++    final y = crop['y'];
++    final z = crop['zoom'] ?? crop['z'];
++    if (x is num && x != 50) query.add('cx=$x');
++    if (y is num && y != 50) query.add('cy=$y');
++    if (z is num && z != 1) query.add('cz=$z');
++  }
++  return '$kaddishPhotoBase$name?${query.join('&')}';
++}
++
++String hebrewDeathLabelFromKaddish(dynamic raw) {
++  if (raw is String) return raw.trim();
++  if (raw is Map) {
++    return '${raw['label'] ?? raw['he'] ?? raw['text'] ?? ''}'.trim();
++  }
++  return '';
++}
++
++Grave graveFromKaddish(Map<String, dynamic> m) {
++  final idRaw = m['id'];
++  final id = idRaw == null ? '' : '$idRaw';
++  var photo = '${m['photo'] ?? ''}'.trim();
++  final extra = int.tryParse(id);
++  if (photo.isEmpty && extra != null && kaddishExtraPhotos.containsKey(extra)) {
++    photo = kaddishExtraPhotos[extra]!;
++  }
++  final thumb = '${m['photoThumbUrl'] ?? m['photoUrl'] ?? ''}'.trim();
++  String? photoUrl;
++  if (thumb.isNotEmpty) {
++    photoUrl = absoluteKaddishUrl(thumb);
++  } else if (photo.isNotEmpty) {
++    photoUrl = photoUrlFromKaddish(photo, m['photoCrop']);
++  }
++
++  final death = m['gregorianDateOfDeath'];
++  int? deathYear = (m['deathYear'] as num?)?.toInt();
++  int? deathMonth = (m['deathMonth'] as num?)?.toInt();
++  int? deathDay = (m['deathDay'] as num?)?.toInt();
++  if (death is Map) {
++    deathYear ??= (death['year'] as num?)?.toInt();
++    deathMonth ??= (death['month'] as num?)?.toInt();
++    deathDay ??=
++        (death['date'] as num?)?.toInt() ?? (death['day'] as num?)?.toInt();
++  }
++
++  final hebrew = m['hebrew'];
++  var hebrewName = '${m['hebrewName'] ?? ''}'.trim();
++  if (hebrewName.isEmpty) {
++    if (hebrew is String) {
++      hebrewName = hebrew.trim();
++    } else if (hebrew is Map) {
++      hebrewName = '${hebrew['name'] ?? hebrew['he'] ?? ''}'.trim();
++    }
++  }
++
++  final title = '${m['title'] ?? ''}'.trim();
++  return Grave(
++    id: 'kaddish-$id',
++    name: '${m['name'] ?? ''}'.trim(),
++    hebrewName: hebrewName,
++    birthYear: (m['birthYear'] as num?)?.toInt(),
++    deathYear: deathYear ?? 0,
++    deathMonth: deathMonth,
++    deathDay: deathDay,
++    section: '${m['section'] ?? ''}'.trim(),
++    row: '${m['row'] ?? ''}'.trim(),
++    notes: title.isEmpty ? const {} : {'he': title, 'en': title, 'ru': title},
++    photoUrl: photoUrl,
++    hebrewDeathLabel: hebrewDeathLabelFromKaddish(m['hebrewDateOfDeath']),
++  );
++}
++
++List<Grave> mergeKaddishGraves(List<Grave> live, List<Grave> bundled) {
++  if (live.isEmpty) return bundled;
++  final extras = {for (final g in bundled) g.id: g};
++  return [
++    for (final g in live)
++      _withLocalExtras(g, extras[g.id]),
++  ];
++}
++
++Grave _withLocalExtras(Grave live, Grave? bundled) {
++  if (bundled == null) return live;
++  if (live.hebrewName.isEmpty && bundled.hebrewName.isNotEmpty) {
++    live.hebrewName = bundled.hebrewName;
++  }
++  if (live.section.isEmpty && bundled.section.isNotEmpty) {
++    live.section = bundled.section;
++  }
++  if (live.row.isEmpty && bundled.row.isNotEmpty) {
++    live.row = bundled.row;
++  }
++  live.birthYear ??= bundled.birthYear;
++  if ((live.photoUrl == null || live.photoUrl!.trim().isEmpty) &&
++      bundled.photoUrl != null &&
++      bundled.photoUrl!.trim().isNotEmpty) {
++    live.photoUrl = bundled.photoUrl;
++  }
++  if (live.hebrewDeathLabel.isEmpty && bundled.hebrewDeathLabel.isNotEmpty) {
++    live.hebrewDeathLabel = bundled.hebrewDeathLabel;
++  }
++  return live;
++}
+diff --git a/lib/data/repository.dart b/lib/data/repository.dart
+index 3c5c4de..d5835a5 100644
+--- a/lib/data/repository.dart
++++ b/lib/data/repository.dart
+@@ -14,7 +14,9 @@ import '../services/notify.dart';
+ import '../services/telegram.dart';
+ import '../services/web_prefs.dart';
+ import '../services/yahrzeit.dart';
++import '../services/cors_proxy.dart';
+ import 'holidays.dart';
++import 'kaddish.dart';
+ import 'snapshot.dart';
+ 
+ /// In-memory data store with mock content for the whole site.
+@@ -75,8 +77,8 @@ class AppRepository extends ChangeNotifier {
+     await TelegramService.instance.loadSavedAsync();
+     await CloudSync.instance.init();
+     await _hydrate();
+-    await _loadKaddishGraves();
+     await _pullCloud();
++    await _loadKaddishGraves();
+     _hydrated = true;
+     _notifyUi();
+     try {
+@@ -901,76 +903,75 @@ class AppRepository extends ChangeNotifier {
+   }
+ 
+   // ---------------------------------------------------------------------------
+-  // Cemetery (loaded from JSON asset — not stored in snapshot)
++  // Cemetery (live kaddish API, with bundled JSON as fallback)
+   // ---------------------------------------------------------------------------
+   late final List<Grave> graves = [];
+ 
+-  static const _kaddishAsset = 'assets/data/kaddish_novosibirsk.json';
+-  static const _kaddishPhotoBase =
+-      'https://synagogue-kadish-shneur.amvera.io/photos/';
++  Future<void> refreshKaddishGraves() => _loadKaddishGraves();
+ 
+   Future<void> _loadKaddishGraves() async {
+-    try {
+-      final raw = await rootBundle.loadString(_kaddishAsset);
+-      final list = jsonDecode(raw);
+-      if (list is! List) return;
+-      final fromFile = [
+-        for (final item in list)
+-          if (item is Map) _graveFromKaddish(Map<String, dynamic>.from(item)),
+-      ];
+-      if (graves.isEmpty || !_gravesEdited) {
+-        graves
+-          ..clear()
+-          ..addAll(fromFile);
+-        return;
++    final bundled = await _loadBundledKaddishGraves();
++    if (bundled.isNotEmpty) {
++      _applyKaddishGraves(bundled);
++    }
++    final live = await _fetchLiveKaddishGraves();
++    final fromFile = mergeKaddishGraves(live, bundled);
++    if (fromFile.isEmpty) return;
++    _applyKaddishGraves(fromFile);
++  }
++
++  void _applyKaddishGraves(List<Grave> fromFile) {
++    if (graves.isEmpty || !_gravesEdited) {
++      graves
++        ..clear()
++        ..addAll(fromFile);
++      _notifyUi();
++      return;
++    }
++    final byId = {for (final g in fromFile) g.id: g};
++    for (final g in graves) {
++      final src = byId[g.id];
++      if (src == null) continue;
++      if (g.photoUrl == null || g.photoUrl!.trim().isEmpty) {
++        g.photoUrl = src.photoUrl;
+       }
+-      final byId = {for (final g in fromFile) g.id: g};
+-      for (final g in graves) {
+-        final src = byId[g.id];
+-        if (src == null) continue;
+-        if (g.photoUrl == null || g.photoUrl!.trim().isEmpty) {
+-          g.photoUrl = src.photoUrl;
+-        }
++      if (g.hebrewDeathLabel.isEmpty && src.hebrewDeathLabel.isNotEmpty) {
++        g.hebrewDeathLabel = src.hebrewDeathLabel;
+       }
+-      final have = {for (final g in graves) g.id};
+-      for (final g in fromFile) {
+-        if (have.add(g.id)) graves.add(g);
++      if (g.name.trim().isEmpty && src.name.isNotEmpty) {
++        g.name = src.name;
+       }
+-    } catch (_) {}
++    }
++    final have = {for (final g in graves) g.id};
++    for (final g in fromFile) {
++      if (have.add(g.id)) graves.add(g);
++    }
++    _notifyUi();
+   }
+ 
+-  Grave _graveFromKaddish(Map<String, dynamic> m) {
+-    final photo = '${m['photo'] ?? ''}'.trim();
+-    final givenUrl = '${m['photoUrl'] ?? ''}'.trim();
+-    String? photoUrl;
+-    if (givenUrl.isNotEmpty) {
+-      photoUrl = givenUrl;
+-    } else if (photo.isNotEmpty) {
+-      photoUrl = '$_kaddishPhotoBase$photo';
+-    }
+-    final hebrew = m['hebrew'];
+-    var hebrewName = '';
+-    if (hebrew is String) {
+-      hebrewName = hebrew.trim();
+-    } else if (hebrew is Map) {
+-      hebrewName = '${hebrew['name'] ?? hebrew['he'] ?? ''}'.trim();
+-    }
+-    final title = '${m['title'] ?? ''}'.trim();
+-    return Grave(
+-      id: 'kaddish-${m['id']}',
+-      name: '${m['name'] ?? ''}'.trim(),
+-      hebrewName: hebrewName,
+-      birthYear: (m['birthYear'] as num?)?.toInt(),
+-      deathYear: (m['deathYear'] as num?)?.toInt() ?? 0,
+-      deathMonth: (m['deathMonth'] as num?)?.toInt(),
+-      deathDay: (m['deathDay'] as num?)?.toInt(),
+-      section: '${m['section'] ?? ''}'.trim(),
+-      row: '${m['row'] ?? ''}'.trim(),
+-      notes: title.isEmpty
+-          ? const {}
+-          : {'he': title, 'en': title, 'ru': title},
+-      photoUrl: photoUrl,
+-    );
++  Future<List<Grave>> _loadBundledKaddishGraves() async {
++    try {
++      final raw = await rootBundle.loadString('assets/data/kaddish_novosibirsk.json');
++      return [
++        for (final item in peopleFromKaddishJson(jsonDecode(raw)))
++          graveFromKaddish(item),
++      ];
++    } catch (_) {
++      return const [];
++    }
++  }
++
++  Future<List<Grave>> _fetchLiveKaddishGraves() async {
++    for (final url in [kaddishPeopleApi, kaddishBoardApi]) {
++      try {
++        final res = await CorsProxy.getDirectOrProxy(url);
++        if (res.statusCode < 200 || res.statusCode >= 300) continue;
++        final people = peopleFromKaddishJson(jsonDecode(res.body));
++        if (people.isEmpty) continue;
++        return [for (final person in people) graveFromKaddish(person)];
++      } catch (_) {}
++    }
++    return const [];
+   }
+ 
+   // ---------------------------------------------------------------------------
+diff --git a/lib/data/snapshot.dart b/lib/data/snapshot.dart
+index b3154a4..6b77f20 100644
+--- a/lib/data/snapshot.dart
++++ b/lib/data/snapshot.dart
+@@ -551,6 +551,7 @@ Map<String, dynamic> graveToJson(Grave g) => {
+       'row': g.row,
+       'notes': locTo(g.notes),
+       'photoUrl': g.photoUrl,
++      if (g.hebrewDeathLabel.isNotEmpty) 'hebrewDeathLabel': g.hebrewDeathLabel,
+     };
+ 
+ Grave graveFromJson(dynamic raw) {
+@@ -567,6 +568,7 @@ Grave graveFromJson(dynamic raw) {
+     row: '${m['row'] ?? ''}',
+     notes: locFrom(m['notes']),
+     photoUrl: '${m['photoUrl'] ?? ''}'.isEmpty ? null : '${m['photoUrl']}',
++    hebrewDeathLabel: '${m['hebrewDeathLabel'] ?? ''}',
+   );
+ }
+ 
+diff --git a/lib/models.dart b/lib/models.dart
+index 612a2f2..cdeb2ae 100644
+--- a/lib/models.dart
++++ b/lib/models.dart
+@@ -256,6 +256,7 @@ class Grave {
+     this.photoUrl,
+     this.deathMonth,
+     this.deathDay,
++    this.hebrewDeathLabel = '',
+   });
+   final String id;
+   String name;
+@@ -268,6 +269,7 @@ class Grave {
+   String row;
+   Loc notes;
+   String? photoUrl;
++  String hebrewDeathLabel;
+ 
+   String get deathLabel {
+     if (deathYear <= 0) return '';
+diff --git a/lib/pages/client/cemetery_page.dart b/lib/pages/client/cemetery_page.dart
+index 8beaf1d..fa698c7 100644
+--- a/lib/pages/client/cemetery_page.dart
++++ b/lib/pages/client/cemetery_page.dart
+@@ -25,6 +25,15 @@ class _CemeteryPageState extends State<CemeteryPage> {
+   static const _kaddishUrl =
+       'https://synagogue-kadish-shneur.amvera.io/s/novosibirsk';
+ 
++  @override
++  void initState() {
++    super.initState();
++    WidgetsBinding.instance.addPostFrameCallback((_) {
++      if (!mounted) return;
++      context.read<AppRepository>().refreshKaddishGraves();
++    });
++  }
++
+   bool _matches(Grave g, String q, String raw, String lang) {
+     if (widget.highlightId != null && g.id == widget.highlightId) return true;
+     if (q.isEmpty) return true;
+@@ -33,6 +42,8 @@ class _CemeteryPageState extends State<CemeteryPage> {
+         g.hebrewName.toLowerCase().contains(q) ||
+         g.hebrewName.contains(raw) ||
+         g.deathLabel.contains(raw) ||
++        g.hebrewDeathLabel.toLowerCase().contains(q) ||
++        g.hebrewDeathLabel.contains(raw) ||
+         trLoc(g.notes, lang).toLowerCase().contains(q);
+   }
+ 
+@@ -135,6 +146,12 @@ class _GraveCard extends StatelessWidget {
+                     Text(subtitle,
+                         style: TextStyle(
+                             color: AppColors.muted, fontSize: 13)),
++                  if (grave.hebrewDeathLabel.isNotEmpty) ...[
++                    const SizedBox(height: 4),
++                    Text(grave.hebrewDeathLabel,
++                        style: TextStyle(
++                            color: AppColors.muted, fontSize: 13)),
++                  ],
+                   if (notes.isNotEmpty) ...[
+                     const SizedBox(height: 8),
+                     Text(notes,
+-- 
+2.43.0
+

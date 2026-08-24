@@ -1,0 +1,280 @@
+From 1256c71e48c6985923caeed57b7a994b75936e8b Mon Sep 17 00:00:00 2001
+From: shneurGreenberg <shneurGreenberg@users.noreply.github.com>
+Date: Mon, 24 Aug 2026 16:06:21 +0000
+Subject: [PATCH] Add a public people embed API for synagogue memorial boards.
+
+Sites can now fetch /s/:slug/api/people and render names, Hebrew dates, and cropped photo thumbnails without scraping the board HTML.
+---
+ app.js                    | 32 +++++++++++++++++++-
+ lib/photo-url.js          | 32 +++++++++++++++++++-
+ lib/public-board.js       | 62 +++++++++++++++++++++++++++++++++++++++
+ test/public-board.test.js | 16 +++++++++-
+ test/smoke.test.js        | 20 +++++++++++++
+ 5 files changed, 159 insertions(+), 3 deletions(-)
+
+diff --git a/app.js b/app.js
+index b8b7bb9..137a5c3 100644
+--- a/app.js
++++ b/app.js
+@@ -16,7 +16,7 @@ const mongoose = require('mongoose');
+ const Synagogue = require('./models/Synagogue');
+ const { loadSynagogueBoard } = require('./lib/load-synagogue-board');
+ const { computeBoardVersion, slimBoardPayload } = require('./lib/board-payload');
+-const { toPublicBoardPayload, toPublicPersonPayload } = require('./lib/public-board');
++const { toPublicBoardPayload, toPublicPersonPayload, toPublicPeoplePayload } = require('./lib/public-board');
+ const { getJewishFeed } = require('./lib/jewish-feed');
+ const { fetchWeatherForecast } = require('./lib/weather-api');
+ const { applyBoardPreviewOverrides } = require('./lib/board-preview');
+@@ -99,6 +99,18 @@ function hostnameFromHostHeader(hostHeader) {
+   }
+ }
+ 
++function publicRequestOrigin(req) {
++  const forwardedProto = String(req.get('X-Forwarded-Proto') || '')
++    .split(',')[0]
++    .trim();
++  const proto = forwardedProto || req.protocol || 'https';
++  const host = getRequestHost(req);
++  if (!host) {
++    return '';
++  }
++  return `${proto}://${host}`;
++}
++
+ function requireSameOrigin(req, res, next) {
+   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+     return next();
+@@ -393,6 +405,24 @@ async function serveSynagogueFavicon(req, res, badge) {
+   }
+ }
+ 
++app.get('/s/:slug/api/people', apiRateLimiter, async (req, res) => {
++  try {
++    const synagogue = await loadSynagogueBoard(req.params.slug);
++
++    if (!synagogue) {
++      return res.status(404).json({ error: 'Synagogue not found' });
++    }
++
++    res.setHeader('Cache-Control', 'public, max-age=300');
++    return res.json(toPublicPeoplePayload(synagogue.people, {
++      origin: publicRequestOrigin(req),
++    }));
++  } catch (err) {
++    console.error('People payload error:', err);
++    return res.status(500).json({ error: publicErrorMessage(err) });
++  }
++});
++
+ app.get('/s/:slug/api/board/version', apiRateLimiter, async (req, res) => {
+   try {
+     const synagogue = await loadSynagogueBoard(req.params.slug);
+diff --git a/lib/photo-url.js b/lib/photo-url.js
+index 9ad13d4..be9073a 100644
+--- a/lib/photo-url.js
++++ b/lib/photo-url.js
+@@ -1,6 +1,8 @@
+ const path = require('path');
++const { normalizePhotoCrop, DEFAULT_PHOTO_CROP } = require('./photo-crop');
+ 
+ const LIST_THUMB_WIDTH = 128;
++const EMBED_THUMB_WIDTH = 280;
+ 
+ function buildPhotoUrl(filename) {
+   if (!filename) {
+@@ -10,7 +12,7 @@ function buildPhotoUrl(filename) {
+   return `/photos/${encodeURIComponent(path.basename(filename))}`;
+ }
+ 
+-function buildPhotoThumbUrl(filename, width = LIST_THUMB_WIDTH) {
++function buildPhotoThumbUrl(filename, width = LIST_THUMB_WIDTH, crop = null) {
+   if (!filename) {
+     return '';
+   }
+@@ -19,11 +21,39 @@ function buildPhotoThumbUrl(filename, width = LIST_THUMB_WIDTH) {
+     w: String(Math.round(width)),
+   });
+ 
++  if (crop) {
++    const normalized = normalizePhotoCrop(crop);
++    if (normalized.x !== DEFAULT_PHOTO_CROP.x) {
++      params.set('cx', String(normalized.x));
++    }
++    if (normalized.y !== DEFAULT_PHOTO_CROP.y) {
++      params.set('cy', String(normalized.y));
++    }
++    if (normalized.zoom !== DEFAULT_PHOTO_CROP.zoom) {
++      params.set('cz', String(normalized.zoom));
++    }
++  }
++
+   return `${buildPhotoUrl(filename)}?${params.toString()}`;
+ }
+ 
++function toAbsoluteAssetUrl(pathname, origin) {
++  if (!pathname) {
++    return '';
++  }
++  if (/^https?:\/\//i.test(pathname)) {
++    return pathname;
++  }
++  if (!origin) {
++    return pathname;
++  }
++  return `${String(origin).replace(/\/$/, '')}${pathname}`;
++}
++
+ module.exports = {
+   LIST_THUMB_WIDTH,
++  EMBED_THUMB_WIDTH,
+   buildPhotoUrl,
+   buildPhotoThumbUrl,
++  toAbsoluteAssetUrl,
+ };
+diff --git a/lib/public-board.js b/lib/public-board.js
+index 7635c39..7a48073 100644
+--- a/lib/public-board.js
++++ b/lib/public-board.js
+@@ -1,5 +1,28 @@
++const Hebcal = require('hebcal');
+ const { getVisibleCommunityEvents } = require('./community-events');
+ const { normalizePublicSubmission } = require('./public-submission');
++const {
++  EMBED_THUMB_WIDTH,
++  buildPhotoThumbUrl,
++  toAbsoluteAssetUrl,
++} = require('./photo-url');
++
++const HEBREW_MONTHS = [
++  '',
++  'ניסן',
++  'אייר',
++  'סיוון',
++  'תמוז',
++  'אב',
++  'אלול',
++  'תשרי',
++  'חשוון',
++  'כסלו',
++  'טבת',
++  'שבט',
++  'אדר',
++  'אדר ב',
++];
+ 
+ const PUBLIC_BOARD_FIELDS = [
+   'slug',
+@@ -69,9 +92,48 @@ function toPublicPersonPayload(person) {
+   return slimPublicPerson(person, { includeText: true });
+ }
+ 
++function hebrewDateOfDeathPayload(gregorianDateOfDeath) {
++  const death = gregorianDateOfDeath || {};
++  if (!death.year || !death.month || !death.date) {
++    return { label: '' };
++  }
++
++  const hdate = new Hebcal.HDate(new Date(death.year, death.month - 1, death.date));
++  const monthName = HEBREW_MONTHS[hdate.getMonth()] || '';
++  return {
++    year: hdate.getFullYear(),
++    month: hdate.getMonth(),
++    date: hdate.getDate(),
++    label: `${hdate.getDate()} ${monthName} ${hdate.getFullYear()}`.trim(),
++  };
++}
++
++function toEmbedPersonPayload(person, { origin = '' } = {}) {
++  const publicPerson = slimPublicPerson(person, { includeText: false });
++  const relativeThumb = publicPerson.photo
++    ? buildPhotoThumbUrl(publicPerson.photo, EMBED_THUMB_WIDTH, publicPerson.photoCrop)
++    : '';
++
++  return {
++    ...publicPerson,
++    photoThumbUrl: toAbsoluteAssetUrl(relativeThumb, origin),
++    hebrewDateOfDeath: hebrewDateOfDeathPayload(publicPerson.gregorianDateOfDeath),
++  };
++}
++
++function toPublicPeoplePayload(people, { origin = '' } = {}) {
++  return {
++    people: Array.isArray(people)
++      ? people.map((person) => toEmbedPersonPayload(person, { origin }))
++      : [],
++  };
++}
++
+ module.exports = {
+   PUBLIC_BOARD_FIELDS,
+   slimPublicPerson,
+   toPublicBoardPayload,
+   toPublicPersonPayload,
++  toEmbedPersonPayload,
++  toPublicPeoplePayload,
+ };
+diff --git a/test/public-board.test.js b/test/public-board.test.js
+index 00e9e77..a4ed445 100644
+--- a/test/public-board.test.js
++++ b/test/public-board.test.js
+@@ -1,6 +1,6 @@
+ const { describe, it } = require('node:test');
+ const assert = require('node:assert/strict');
+-const { toPublicBoardPayload, toPublicPersonPayload } = require('../lib/public-board');
++const { toPublicBoardPayload, toPublicPersonPayload, toPublicPeoplePayload } = require('../lib/public-board');
+ 
+ describe('public board payload', () => {
+   const sampleBoard = {
+@@ -90,4 +90,18 @@ describe('public board payload', () => {
+     assert.equal(person.contacts, undefined);
+     assert.equal(person.id, 1);
+   });
++
++  it('builds an embed people payload with thumbs and hebrew dates', () => {
++    const payload = toPublicPeoplePayload(sampleBoard.people, {
++      origin: 'https://example.test',
++    });
++    assert.equal(payload.people.length, 1);
++    const person = payload.people[0];
++    assert.equal(person.name, 'Person One');
++    assert.equal(person.text, undefined);
++    assert.equal(person.contact, undefined);
++    assert.ok(person.photoThumbUrl.startsWith('https://example.test/photos/a.jpg?w=280'));
++    assert.equal(typeof person.hebrewDateOfDeath.label, 'string');
++    assert.ok(person.hebrewDateOfDeath.label.length > 0);
++  });
+ });
+diff --git a/test/smoke.test.js b/test/smoke.test.js
+index d29b523..fd77a04 100644
+--- a/test/smoke.test.js
++++ b/test/smoke.test.js
+@@ -143,6 +143,26 @@ describe('http smoke', () => {
+     }
+   });
+ 
++  it('returns a public people embed payload', async () => {
++    const res = await request('GET', `/s/${SLUG}/api/people`);
++    assert.equal(res.status, 200);
++    assert.equal(res.headers['access-control-allow-origin'], '*');
++    const payload = res.json();
++    assert.ok(Array.isArray(payload.people));
++    assert.ok(payload.people.length > 0);
++    const withPhoto = payload.people.find((person) => person.photo);
++    if (withPhoto) {
++      assert.ok(String(withPhoto.photoThumbUrl).includes('/photos/'));
++      assert.ok(String(withPhoto.photoThumbUrl).startsWith('http'));
++    }
++    for (const person of payload.people) {
++      assert.equal(person.contact, undefined);
++      assert.equal(person.contacts, undefined);
++      assert.equal(person.text, undefined);
++      assert.ok(person.hebrewDateOfDeath);
++    }
++  });
++
+   it('returns person detail without contact fields', async () => {
+     const board = await request('GET', `/s/${SLUG}/api/board`);
+     const first = board.json().people[0];
+-- 
+2.43.0
+
