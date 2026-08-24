@@ -1,0 +1,765 @@
+From 55036377aacf4a2db72cc1ed3f9de398fe6b5868 Mon Sep 17 00:00:00 2001
+From: shneurGreenberg <shneurGreenberg@users.noreply.github.com>
+Date: Mon, 24 Aug 2026 16:06:21 +0000
+Subject: [PATCH 1/2] Load cemetery names and photos from the live kaddish
+ people API.
+
+The cemetery page now reads the public Novosibirsk registry at runtime, with the bundled JSON kept as an offline fallback.
+---
+ lib/data/kaddish.dart               | 147 ++++++++++++++++++++++++++++
+ lib/data/repository.dart            | 123 +++++++++++------------
+ lib/data/snapshot.dart              |   2 +
+ lib/models.dart                     |   2 +
+ lib/pages/client/cemetery_page.dart |  17 ++++
+ 5 files changed, 230 insertions(+), 61 deletions(-)
+ create mode 100644 lib/data/kaddish.dart
+
+diff --git a/lib/data/kaddish.dart b/lib/data/kaddish.dart
+new file mode 100644
+index 0000000..42f0026
+--- /dev/null
++++ b/lib/data/kaddish.dart
+@@ -0,0 +1,147 @@
++import '../models.dart';
++
++/// Live Novosibirsk kaddish registry used by the cemetery page.
++const kaddishHost = 'https://synagogue-kadish-shneur.amvera.io';
++const kaddishPeopleApi = '$kaddishHost/s/novosibirsk/api/people';
++const kaddishBoardApi = '$kaddishHost/s/novosibirsk/api/board';
++const kaddishPhotoBase = '$kaddishHost/photos/';
++
++/// Files that exist on the photo host even when the board record has no photo.
++const kaddishExtraPhotos = {193: '193.jpg'};
++
++List<Map<String, dynamic>> peopleFromKaddishJson(dynamic raw) {
++  if (raw is List) {
++    return [
++      for (final item in raw)
++        if (item is Map) Map<String, dynamic>.from(item),
++    ];
++  }
++  if (raw is Map) {
++    final people = raw['people'];
++    if (people is List) {
++      return [
++        for (final item in people)
++          if (item is Map) Map<String, dynamic>.from(item),
++      ];
++    }
++  }
++  return const [];
++}
++
++String absoluteKaddishUrl(String value) {
++  final v = value.trim();
++  if (v.isEmpty) return '';
++  if (v.startsWith('http://') || v.startsWith('https://')) return v;
++  if (v.startsWith('//')) return 'https:$v';
++  if (v.startsWith('/')) return '$kaddishHost$v';
++  return '$kaddishPhotoBase$v';
++}
++
++String photoUrlFromKaddish(String filename, dynamic crop) {
++  final name = filename.trim();
++  if (name.isEmpty) return '';
++  final query = <String>['w=280'];
++  if (crop is Map) {
++    final x = crop['x'];
++    final y = crop['y'];
++    final z = crop['zoom'] ?? crop['z'];
++    if (x is num && x != 50) query.add('cx=$x');
++    if (y is num && y != 50) query.add('cy=$y');
++    if (z is num && z != 1) query.add('cz=$z');
++  }
++  return '$kaddishPhotoBase$name?${query.join('&')}';
++}
++
++String hebrewDeathLabelFromKaddish(dynamic raw) {
++  if (raw is String) return raw.trim();
++  if (raw is Map) {
++    return '${raw['label'] ?? raw['he'] ?? raw['text'] ?? ''}'.trim();
++  }
++  return '';
++}
++
++Grave graveFromKaddish(Map<String, dynamic> m) {
++  final idRaw = m['id'];
++  final id = idRaw == null ? '' : '$idRaw';
++  var photo = '${m['photo'] ?? ''}'.trim();
++  final extra = int.tryParse(id);
++  if (photo.isEmpty && extra != null && kaddishExtraPhotos.containsKey(extra)) {
++    photo = kaddishExtraPhotos[extra]!;
++  }
++  final thumb = '${m['photoThumbUrl'] ?? m['photoUrl'] ?? ''}'.trim();
++  String? photoUrl;
++  if (thumb.isNotEmpty) {
++    photoUrl = absoluteKaddishUrl(thumb);
++  } else if (photo.isNotEmpty) {
++    photoUrl = photoUrlFromKaddish(photo, m['photoCrop']);
++  }
++
++  final death = m['gregorianDateOfDeath'];
++  int? deathYear = (m['deathYear'] as num?)?.toInt();
++  int? deathMonth = (m['deathMonth'] as num?)?.toInt();
++  int? deathDay = (m['deathDay'] as num?)?.toInt();
++  if (death is Map) {
++    deathYear ??= (death['year'] as num?)?.toInt();
++    deathMonth ??= (death['month'] as num?)?.toInt();
++    deathDay ??=
++        (death['date'] as num?)?.toInt() ?? (death['day'] as num?)?.toInt();
++  }
++
++  final hebrew = m['hebrew'];
++  var hebrewName = '${m['hebrewName'] ?? ''}'.trim();
++  if (hebrewName.isEmpty) {
++    if (hebrew is String) {
++      hebrewName = hebrew.trim();
++    } else if (hebrew is Map) {
++      hebrewName = '${hebrew['name'] ?? hebrew['he'] ?? ''}'.trim();
++    }
++  }
++
++  final title = '${m['title'] ?? ''}'.trim();
++  return Grave(
++    id: 'kaddish-$id',
++    name: '${m['name'] ?? ''}'.trim(),
++    hebrewName: hebrewName,
++    birthYear: (m['birthYear'] as num?)?.toInt(),
++    deathYear: deathYear ?? 0,
++    deathMonth: deathMonth,
++    deathDay: deathDay,
++    section: '${m['section'] ?? ''}'.trim(),
++    row: '${m['row'] ?? ''}'.trim(),
++    notes: title.isEmpty ? const {} : {'he': title, 'en': title, 'ru': title},
++    photoUrl: photoUrl,
++    hebrewDeathLabel: hebrewDeathLabelFromKaddish(m['hebrewDateOfDeath']),
++  );
++}
++
++List<Grave> mergeKaddishGraves(List<Grave> live, List<Grave> bundled) {
++  if (live.isEmpty) return bundled;
++  final extras = {for (final g in bundled) g.id: g};
++  return [
++    for (final g in live)
++      _withLocalExtras(g, extras[g.id]),
++  ];
++}
++
++Grave _withLocalExtras(Grave live, Grave? bundled) {
++  if (bundled == null) return live;
++  if (live.hebrewName.isEmpty && bundled.hebrewName.isNotEmpty) {
++    live.hebrewName = bundled.hebrewName;
++  }
++  if (live.section.isEmpty && bundled.section.isNotEmpty) {
++    live.section = bundled.section;
++  }
++  if (live.row.isEmpty && bundled.row.isNotEmpty) {
++    live.row = bundled.row;
++  }
++  live.birthYear ??= bundled.birthYear;
++  if ((live.photoUrl == null || live.photoUrl!.trim().isEmpty) &&
++      bundled.photoUrl != null &&
++      bundled.photoUrl!.trim().isNotEmpty) {
++    live.photoUrl = bundled.photoUrl;
++  }
++  if (live.hebrewDeathLabel.isEmpty && bundled.hebrewDeathLabel.isNotEmpty) {
++    live.hebrewDeathLabel = bundled.hebrewDeathLabel;
++  }
++  return live;
++}
+diff --git a/lib/data/repository.dart b/lib/data/repository.dart
+index 3c5c4de..d5835a5 100644
+--- a/lib/data/repository.dart
++++ b/lib/data/repository.dart
+@@ -14,7 +14,9 @@ import '../services/notify.dart';
+ import '../services/telegram.dart';
+ import '../services/web_prefs.dart';
+ import '../services/yahrzeit.dart';
++import '../services/cors_proxy.dart';
+ import 'holidays.dart';
++import 'kaddish.dart';
+ import 'snapshot.dart';
+ 
+ /// In-memory data store with mock content for the whole site.
+@@ -75,8 +77,8 @@ class AppRepository extends ChangeNotifier {
+     await TelegramService.instance.loadSavedAsync();
+     await CloudSync.instance.init();
+     await _hydrate();
+-    await _loadKaddishGraves();
+     await _pullCloud();
++    await _loadKaddishGraves();
+     _hydrated = true;
+     _notifyUi();
+     try {
+@@ -901,76 +903,75 @@ class AppRepository extends ChangeNotifier {
+   }
+ 
+   // ---------------------------------------------------------------------------
+-  // Cemetery (loaded from JSON asset — not stored in snapshot)
++  // Cemetery (live kaddish API, with bundled JSON as fallback)
+   // ---------------------------------------------------------------------------
+   late final List<Grave> graves = [];
+ 
+-  static const _kaddishAsset = 'assets/data/kaddish_novosibirsk.json';
+-  static const _kaddishPhotoBase =
+-      'https://synagogue-kadish-shneur.amvera.io/photos/';
++  Future<void> refreshKaddishGraves() => _loadKaddishGraves();
+ 
+   Future<void> _loadKaddishGraves() async {
+-    try {
+-      final raw = await rootBundle.loadString(_kaddishAsset);
+-      final list = jsonDecode(raw);
+-      if (list is! List) return;
+-      final fromFile = [
+-        for (final item in list)
+-          if (item is Map) _graveFromKaddish(Map<String, dynamic>.from(item)),
+-      ];
+-      if (graves.isEmpty || !_gravesEdited) {
+-        graves
+-          ..clear()
+-          ..addAll(fromFile);
+-        return;
++    final bundled = await _loadBundledKaddishGraves();
++    if (bundled.isNotEmpty) {
++      _applyKaddishGraves(bundled);
++    }
++    final live = await _fetchLiveKaddishGraves();
++    final fromFile = mergeKaddishGraves(live, bundled);
++    if (fromFile.isEmpty) return;
++    _applyKaddishGraves(fromFile);
++  }
++
++  void _applyKaddishGraves(List<Grave> fromFile) {
++    if (graves.isEmpty || !_gravesEdited) {
++      graves
++        ..clear()
++        ..addAll(fromFile);
++      _notifyUi();
++      return;
++    }
++    final byId = {for (final g in fromFile) g.id: g};
++    for (final g in graves) {
++      final src = byId[g.id];
++      if (src == null) continue;
++      if (g.photoUrl == null || g.photoUrl!.trim().isEmpty) {
++        g.photoUrl = src.photoUrl;
+       }
+-      final byId = {for (final g in fromFile) g.id: g};
+-      for (final g in graves) {
+-        final src = byId[g.id];
+-        if (src == null) continue;
+-        if (g.photoUrl == null || g.photoUrl!.trim().isEmpty) {
+-          g.photoUrl = src.photoUrl;
+-        }
++      if (g.hebrewDeathLabel.isEmpty && src.hebrewDeathLabel.isNotEmpty) {
++        g.hebrewDeathLabel = src.hebrewDeathLabel;
+       }
+-      final have = {for (final g in graves) g.id};
+-      for (final g in fromFile) {
+-        if (have.add(g.id)) graves.add(g);
++      if (g.name.trim().isEmpty && src.name.isNotEmpty) {
++        g.name = src.name;
+       }
+-    } catch (_) {}
++    }
++    final have = {for (final g in graves) g.id};
++    for (final g in fromFile) {
++      if (have.add(g.id)) graves.add(g);
++    }
++    _notifyUi();
+   }
+ 
+-  Grave _graveFromKaddish(Map<String, dynamic> m) {
+-    final photo = '${m['photo'] ?? ''}'.trim();
+-    final givenUrl = '${m['photoUrl'] ?? ''}'.trim();
+-    String? photoUrl;
+-    if (givenUrl.isNotEmpty) {
+-      photoUrl = givenUrl;
+-    } else if (photo.isNotEmpty) {
+-      photoUrl = '$_kaddishPhotoBase$photo';
+-    }
+-    final hebrew = m['hebrew'];
+-    var hebrewName = '';
+-    if (hebrew is String) {
+-      hebrewName = hebrew.trim();
+-    } else if (hebrew is Map) {
+-      hebrewName = '${hebrew['name'] ?? hebrew['he'] ?? ''}'.trim();
+-    }
+-    final title = '${m['title'] ?? ''}'.trim();
+-    return Grave(
+-      id: 'kaddish-${m['id']}',
+-      name: '${m['name'] ?? ''}'.trim(),
+-      hebrewName: hebrewName,
+-      birthYear: (m['birthYear'] as num?)?.toInt(),
+-      deathYear: (m['deathYear'] as num?)?.toInt() ?? 0,
+-      deathMonth: (m['deathMonth'] as num?)?.toInt(),
+-      deathDay: (m['deathDay'] as num?)?.toInt(),
+-      section: '${m['section'] ?? ''}'.trim(),
+-      row: '${m['row'] ?? ''}'.trim(),
+-      notes: title.isEmpty
+-          ? const {}
+-          : {'he': title, 'en': title, 'ru': title},
+-      photoUrl: photoUrl,
+-    );
++  Future<List<Grave>> _loadBundledKaddishGraves() async {
++    try {
++      final raw = await rootBundle.loadString('assets/data/kaddish_novosibirsk.json');
++      return [
++        for (final item in peopleFromKaddishJson(jsonDecode(raw)))
++          graveFromKaddish(item),
++      ];
++    } catch (_) {
++      return const [];
++    }
++  }
++
++  Future<List<Grave>> _fetchLiveKaddishGraves() async {
++    for (final url in [kaddishPeopleApi, kaddishBoardApi]) {
++      try {
++        final res = await CorsProxy.getDirectOrProxy(url);
++        if (res.statusCode < 200 || res.statusCode >= 300) continue;
++        final people = peopleFromKaddishJson(jsonDecode(res.body));
++        if (people.isEmpty) continue;
++        return [for (final person in people) graveFromKaddish(person)];
++      } catch (_) {}
++    }
++    return const [];
+   }
+ 
+   // ---------------------------------------------------------------------------
+diff --git a/lib/data/snapshot.dart b/lib/data/snapshot.dart
+index b3154a4..6b77f20 100644
+--- a/lib/data/snapshot.dart
++++ b/lib/data/snapshot.dart
+@@ -551,6 +551,7 @@ Map<String, dynamic> graveToJson(Grave g) => {
+       'row': g.row,
+       'notes': locTo(g.notes),
+       'photoUrl': g.photoUrl,
++      if (g.hebrewDeathLabel.isNotEmpty) 'hebrewDeathLabel': g.hebrewDeathLabel,
+     };
+ 
+ Grave graveFromJson(dynamic raw) {
+@@ -567,6 +568,7 @@ Grave graveFromJson(dynamic raw) {
+     row: '${m['row'] ?? ''}',
+     notes: locFrom(m['notes']),
+     photoUrl: '${m['photoUrl'] ?? ''}'.isEmpty ? null : '${m['photoUrl']}',
++    hebrewDeathLabel: '${m['hebrewDeathLabel'] ?? ''}',
+   );
+ }
+ 
+diff --git a/lib/models.dart b/lib/models.dart
+index 612a2f2..cdeb2ae 100644
+--- a/lib/models.dart
++++ b/lib/models.dart
+@@ -256,6 +256,7 @@ class Grave {
+     this.photoUrl,
+     this.deathMonth,
+     this.deathDay,
++    this.hebrewDeathLabel = '',
+   });
+   final String id;
+   String name;
+@@ -268,6 +269,7 @@ class Grave {
+   String row;
+   Loc notes;
+   String? photoUrl;
++  String hebrewDeathLabel;
+ 
+   String get deathLabel {
+     if (deathYear <= 0) return '';
+diff --git a/lib/pages/client/cemetery_page.dart b/lib/pages/client/cemetery_page.dart
+index 8beaf1d..fa698c7 100644
+--- a/lib/pages/client/cemetery_page.dart
++++ b/lib/pages/client/cemetery_page.dart
+@@ -25,6 +25,15 @@ class _CemeteryPageState extends State<CemeteryPage> {
+   static const _kaddishUrl =
+       'https://synagogue-kadish-shneur.amvera.io/s/novosibirsk';
+ 
++  @override
++  void initState() {
++    super.initState();
++    WidgetsBinding.instance.addPostFrameCallback((_) {
++      if (!mounted) return;
++      context.read<AppRepository>().refreshKaddishGraves();
++    });
++  }
++
+   bool _matches(Grave g, String q, String raw, String lang) {
+     if (widget.highlightId != null && g.id == widget.highlightId) return true;
+     if (q.isEmpty) return true;
+@@ -33,6 +42,8 @@ class _CemeteryPageState extends State<CemeteryPage> {
+         g.hebrewName.toLowerCase().contains(q) ||
+         g.hebrewName.contains(raw) ||
+         g.deathLabel.contains(raw) ||
++        g.hebrewDeathLabel.toLowerCase().contains(q) ||
++        g.hebrewDeathLabel.contains(raw) ||
+         trLoc(g.notes, lang).toLowerCase().contains(q);
+   }
+ 
+@@ -135,6 +146,12 @@ class _GraveCard extends StatelessWidget {
+                     Text(subtitle,
+                         style: TextStyle(
+                             color: AppColors.muted, fontSize: 13)),
++                  if (grave.hebrewDeathLabel.isNotEmpty) ...[
++                    const SizedBox(height: 4),
++                    Text(grave.hebrewDeathLabel,
++                        style: TextStyle(
++                            color: AppColors.muted, fontSize: 13)),
++                  ],
+                   if (notes.isNotEmpty) ...[
+                     const SizedBox(height: 8),
+                     Text(notes,
+-- 
+2.43.0
+
+
+From 6a803d722b08cbe07d3f6279c685add6da056d99 Mon Sep 17 00:00:00 2001
+From: shneurGreenberg <shneurGreenberg@users.noreply.github.com>
+Date: Mon, 24 Aug 2026 21:26:43 +0000
+Subject: [PATCH 2/2] Show kaddish portraits on GitHub Pages via hash routes
+ and the live board API.
+
+Keep /#/cemetery working, copy 404.html for path URLs, and stop cloud snapshots from replacing registry photos.
+---
+ .github/workflows/deploy-github-pages.yml |  3 +
+ lib/data/repository.dart                  | 48 ++++++--------
+ lib/main.dart                             |  3 +
+ pubspec.lock                              | 20 +++---
+ pubspec.yaml                              |  2 +
+ tool/sync_kaddish.py                      | 80 +++++++++++++++++------
+ web/index.html                            | 14 ++++
+ 7 files changed, 111 insertions(+), 59 deletions(-)
+
+diff --git a/.github/workflows/deploy-github-pages.yml b/.github/workflows/deploy-github-pages.yml
+index 0d5aeab..321bd08 100644
+--- a/.github/workflows/deploy-github-pages.yml
++++ b/.github/workflows/deploy-github-pages.yml
+@@ -34,6 +34,9 @@ jobs:
+       - name: Build web
+         run: flutter build web --release --base-href /chabad-site/ --no-tree-shake-icons --no-wasm-dry-run
+ 
++      - name: GitHub Pages SPA fallback
++        run: cp build/web/index.html build/web/404.html
++
+       - name: Upload Pages artifact
+         uses: actions/upload-pages-artifact@v3
+         with:
+diff --git a/lib/data/repository.dart b/lib/data/repository.dart
+index d5835a5..39c48c0 100644
+--- a/lib/data/repository.dart
++++ b/lib/data/repository.dart
+@@ -921,31 +921,14 @@ class AppRepository extends ChangeNotifier {
+   }
+ 
+   void _applyKaddishGraves(List<Grave> fromFile) {
+-    if (graves.isEmpty || !_gravesEdited) {
+-      graves
+-        ..clear()
+-        ..addAll(fromFile);
+-      _notifyUi();
+-      return;
+-    }
+-    final byId = {for (final g in fromFile) g.id: g};
+-    for (final g in graves) {
+-      final src = byId[g.id];
+-      if (src == null) continue;
+-      if (g.photoUrl == null || g.photoUrl!.trim().isEmpty) {
+-        g.photoUrl = src.photoUrl;
+-      }
+-      if (g.hebrewDeathLabel.isEmpty && src.hebrewDeathLabel.isNotEmpty) {
+-        g.hebrewDeathLabel = src.hebrewDeathLabel;
+-      }
+-      if (g.name.trim().isEmpty && src.name.isNotEmpty) {
+-        g.name = src.name;
+-      }
+-    }
+-    final have = {for (final g in graves) g.id};
+-    for (final g in fromFile) {
+-      if (have.add(g.id)) graves.add(g);
+-    }
++    // Always take portraits/names from the kaddish registry. Keep only
++    // admin-created graves (ids that are not kaddish-*) so a cloud snapshot
++    // without photos cannot hide the board portraits.
++    final custom = graves.where((g) => !g.id.startsWith('kaddish-')).toList();
++    graves
++      ..clear()
++      ..addAll(fromFile)
++      ..addAll(custom);
+     _notifyUi();
+   }
+ 
+@@ -2281,10 +2264,17 @@ class AppRepository extends ChangeNotifier {
+         ..addAll((m['orders'] as List).map(orderFromJson));
+     }
+     if (m['graves'] is List) {
+-      _gravesEdited = true;
+-      graves
+-        ..clear()
+-        ..addAll((m['graves'] as List).map(graveFromJson));
++      final loaded = [
++        for (final item in m['graves'] as List) graveFromJson(item),
++      ];
++      final custom =
++          loaded.where((g) => !g.id.startsWith('kaddish-')).toList();
++      if (custom.isNotEmpty) {
++        _gravesEdited = true;
++        graves
++          ..clear()
++          ..addAll(custom);
++      }
+     }
+ 
+     final seq = (m['seq'] as num?)?.toInt();
+diff --git a/lib/main.dart b/lib/main.dart
+index 834a1bc..7ea7c65 100644
+--- a/lib/main.dart
++++ b/lib/main.dart
+@@ -1,5 +1,6 @@
+ import 'package:flutter/material.dart';
+ import 'package:flutter_localizations/flutter_localizations.dart';
++import 'package:flutter_web_plugins/flutter_web_plugins.dart';
+ import 'package:provider/provider.dart';
+ 
+ import 'data/repository.dart';
+@@ -12,6 +13,8 @@ import 'theme.dart';
+ final appMessengerKey = GlobalKey<ScaffoldMessengerState>();
+ 
+ Future<void> main() async {
++  // Hash URLs so GitHub Pages can open /#/cemetery without a server 404.
++  setUrlStrategy(HashUrlStrategy());
+   WidgetsFlutterBinding.ensureInitialized();
+   await CloudSync.instance.init();
+   runApp(const ChabadApp());
+diff --git a/pubspec.lock b/pubspec.lock
+index 29f2c0f..3ea81f2 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -337,10 +337,10 @@ packages:
+     dependency: "direct main"
+     description:
+       name: intl
+-      sha256: "3df61194eb431efc39c4ceba583b95633a403f46c9fd341e550ce0bfa50e9aa5"
++      sha256: "1ca20c894b1717686a2319b8548763d812bc0aabdac580420a44c5178c57a867"
+       url: "https://pub.dev"
+     source: hosted
+-    version: "0.20.2"
++    version: "0.20.3"
+   leak_tracker:
+     dependency: transitive
+     description:
+@@ -385,10 +385,10 @@ packages:
+     dependency: transitive
+     description:
+       name: matcher
+-      sha256: dc0b7dc7651697ea4ff3e69ef44b0407ea32c487a39fff6a4004fa585e901861
++      sha256: "31bd099b47c10cd1aeb55146a2d46ce0277630ecef3f7dae54ad7873f36696cd"
+       url: "https://pub.dev"
+     source: hosted
+-    version: "0.12.19"
++    version: "0.12.20"
+   material_color_utilities:
+     dependency: transitive
+     description:
+@@ -401,10 +401,10 @@ packages:
+     dependency: transitive
+     description:
+       name: meta
+-      sha256: "1741988757a65eb6b36abe716829688cf01910bbf91c34354ff7ec1c3de2b349"
++      sha256: "307249ce4ff29d58a18e97f6345f539382eb9c9c29ecda628900f31de0443dd9"
+       url: "https://pub.dev"
+     source: hosted
+-    version: "1.18.0"
++    version: "1.19.0"
+   mime:
+     dependency: transitive
+     description:
+@@ -510,10 +510,10 @@ packages:
+     dependency: transitive
+     description:
+       name: test_api
+-      sha256: "949a932224383300f01be9221c39180316445ecb8e7547f70a41a35bf421fb9e"
++      sha256: "2a122cbe059f8b610d3a5415f42e255b6c17b1f21eee1d960f31080237fb4f11"
+       url: "https://pub.dev"
+     source: hosted
+-    version: "0.7.11"
++    version: "0.7.12"
+   typed_data:
+     dependency: transitive
+     description:
+@@ -526,10 +526,10 @@ packages:
+     dependency: transitive
+     description:
+       name: vector_math
+-      sha256: d530bd74fea330e6e364cda7a85019c434070188383e1cd8d9777ee586914c5b
++      sha256: f36f9f3be64c6198714492bb455c11056e33e2f85d9a0b676a48301e44fdcf47
+       url: "https://pub.dev"
+     source: hosted
+-    version: "2.2.0"
++    version: "2.4.2"
+   vm_service:
+     dependency: transitive
+     description:
+diff --git a/pubspec.yaml b/pubspec.yaml
+index 43113eb..fa2e38f 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -32,6 +32,8 @@ dependencies:
+     sdk: flutter
+   flutter_localizations:
+     sdk: flutter
++  flutter_web_plugins:
++    sdk: flutter
+ 
+   go_router: ^17.4.0
+   provider: ^6.1.5+1
+diff --git a/tool/sync_kaddish.py b/tool/sync_kaddish.py
+index 8ebf9f7..2b8d3fd 100644
+--- a/tool/sync_kaddish.py
++++ b/tool/sync_kaddish.py
+@@ -1,23 +1,25 @@
+ import json
+-import re
++import urllib.request
+ from pathlib import Path
+ 
+-html_path = Path.home() / "AppData/Local/Temp/kaddish-page.html"
+-html = html_path.read_text(encoding="utf-8")
+-match = re.search(r"window\.data\s*=\s*(\{.*?\})\s*;\s*</script>", html, re.S)
+-if not match:
+-    raise SystemExit("window.data not found")
+-live = json.loads(match.group(1))
+-people = live["people"]
++PEOPLE_API = "https://synagogue-kadish-shneur.amvera.io/s/novosibirsk/api/people"
++BOARD_API = "https://synagogue-kadish-shneur.amvera.io/s/novosibirsk/api/board"
++PHOTO_BASE = "https://synagogue-kadish-shneur.amvera.io/photos/"
++EXTRA_PHOTOS = {193: "193.jpg"}
+ 
+-root = Path(__file__).resolve().parents[1]
+-local_path = root / "assets/data/kaddish_novosibirsk.json"
+-local = json.loads(local_path.read_text(encoding="utf-8"))
+-by_id = {int(x["id"]): x for x in local}
+ 
+-base = "https://synagogue-kadish-shneur.amvera.io/photos/"
+-# Files that exist on the photo host even when the board record has no photo field.
+-extra_photos = {193: "193.jpg"}
++def fetch_json(url):
++    req = urllib.request.Request(url, headers={"Accept": "application/json"})
++    with urllib.request.urlopen(req, timeout=30) as res:
++        return json.loads(res.read().decode("utf-8"))
++
++
++def people_from_payload(payload):
++    if isinstance(payload, list):
++        return payload
++    if isinstance(payload, dict) and isinstance(payload.get("people"), list):
++        return payload["people"]
++    return []
+ 
+ 
+ def photo_url(filename, crop):
+@@ -32,8 +34,40 @@ def photo_url(filename, crop):
+             query.append(f"cy={y}")
+         if isinstance(z, (int, float)) and z != 1:
+             query.append(f"cz={z}")
+-    return f"{base}{filename}?{'&'.join(query)}"
++    return f"{PHOTO_BASE}{filename}?{'&'.join(query)}"
++
++
++def absolute_url(value):
++    url = str(value or "").strip()
++    if not url:
++        return ""
++    if url.startswith("http://") or url.startswith("https://"):
++        return url
++    if url.startswith("//"):
++        return f"https:{url}"
++    if url.startswith("/"):
++        return f"https://synagogue-kadish-shneur.amvera.io{url}"
++    return f"{PHOTO_BASE}{url}"
++
++
++people = []
++for url in (PEOPLE_API, BOARD_API):
++    try:
++        people = people_from_payload(fetch_json(url))
++    except Exception as err:
++        print(f"{url} failed: {err}")
++        continue
++    if people:
++        print(f"loaded {len(people)} people from {url}")
++        break
++
++if not people:
++    raise SystemExit("no people from kaddish APIs")
+ 
++root = Path(__file__).resolve().parents[1]
++local_path = root / "assets/data/kaddish_novosibirsk.json"
++local = json.loads(local_path.read_text(encoding="utf-8"))
++by_id = {int(x["id"]): x for x in local}
+ 
+ out = []
+ for person in people:
+@@ -41,9 +75,10 @@ for person in people:
+     old = by_id.get(pid, {})
+     death = person.get("gregorianDateOfDeath") or {}
+     photo = str(person.get("photo") or "").strip()
+-    if not photo and pid in extra_photos:
+-        photo = extra_photos[pid]
++    if not photo and pid in EXTRA_PHOTOS:
++        photo = EXTRA_PHOTOS[pid]
+     crop = person.get("photoCrop") if isinstance(person.get("photoCrop"), dict) else None
++    thumb = str(person.get("photoThumbUrl") or person.get("photoUrl") or "").strip()
+     rec = {
+         "id": pid,
+         "name": person.get("name") or old.get("name") or "",
+@@ -53,8 +88,13 @@ for person in people:
+         "deathDay": death.get("date") or old.get("deathDay"),
+         "hebrew": old.get("hebrew") or {},
+         "photo": photo,
+-        "photoUrl": photo_url(photo, crop) if photo else "",
++        "photoUrl": absolute_url(thumb) or (photo_url(photo, crop) if photo else ""),
+     }
++    hebrew_death = person.get("hebrewDateOfDeath")
++    if isinstance(hebrew_death, dict) and hebrew_death.get("label"):
++        rec["hebrewDeathLabel"] = hebrew_death["label"]
++    elif isinstance(hebrew_death, str) and hebrew_death.strip():
++        rec["hebrewDeathLabel"] = hebrew_death.strip()
+     if crop:
+         rec["photoCrop"] = crop
+     for key in ("birthYear", "section", "row"):
+@@ -62,6 +102,6 @@ for person in people:
+             rec[key] = old[key]
+     out.append(rec)
+ 
+-with_photo = sum(1 for item in out if item.get("photo"))
++with_photo = sum(1 for item in out if item.get("photoUrl"))
+ local_path.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+ print(f"wrote {len(out)} records, {with_photo} with photos")
+diff --git a/web/index.html b/web/index.html
+index 869eae8..e8c7878 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -108,6 +108,20 @@
+     window.addEventListener('flutter-first-frame', hideSplash);
+     setTimeout(hideSplash, 8000);
+   </script>
++  <script>
++    (function () {
++      var baseEl = document.querySelector('base');
++      var base = (baseEl && baseEl.getAttribute('href')) || '/';
++      if (base.charAt(base.length - 1) === '/') base = base.slice(0, -1);
++      var path = location.pathname || '/';
++      if (base && path.indexOf(base) === 0) {
++        path = path.slice(base.length) || '/';
++      }
++      if (path !== '/' && !location.hash) {
++        location.replace(base + '/#' + path + (location.search || ''));
++      }
++    })();
++  </script>
+   <script src="flutter_bootstrap.js" async></script>
+ </body>
+ </html>
+-- 
+2.43.0
+

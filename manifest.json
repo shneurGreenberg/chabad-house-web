@@ -1,11 +1,11 @@
 {
-    "name": "flutter_app",
-    "short_name": "flutter_app",
+    "name": "בית חב״ד בית מנחם",
+    "short_name": "בית מנחם",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "background_color": "#0B1C3A",
+    "theme_color": "#0B1C3A",
+    "description": "בית חב״ד ובית הכנסת בית מנחם בנובוסיבירסק",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [
