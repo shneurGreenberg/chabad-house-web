@@ -2,4 +2,4 @@ User-agent: *
 Allow: /
 Disallow: /admin
 
-Sitemap: https://shneurgreenberg.github.io/chabad-house-web/sitemap.xml
+Sitemap: https://shneurgreenberg.github.io/chabad-site/sitemap.xml
